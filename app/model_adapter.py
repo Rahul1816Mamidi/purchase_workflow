@@ -1,0 +1,114 @@
+import json
+from abc import ABC, abstractmethod
+from typing import Any
+
+from .models import ModelRecommendation
+
+
+class TemporaryModelError(Exception):
+    pass
+
+
+class PersistentModelError(Exception):
+    pass
+
+
+class ModelAdapter(ABC):
+    @abstractmethod
+    def recommend(
+        self, request: dict[str, Any], tool_results: dict[str, Any]
+    ) -> ModelRecommendation:
+        raise NotImplementedError
+
+
+class MockModelAdapter(ModelAdapter):
+    """
+    Deterministic adapter for local execution and automated tests.
+
+    Scenarios:
+    valid
+    malformed
+    unsupported_claim
+    temporary_timeout
+    persistent_failure
+    """
+
+    def __init__(self, scenario: str = "valid"):
+        self.scenario = scenario
+        self.calls = 0
+
+    def recommend(
+        self, request: dict[str, Any], tool_results: dict[str, Any]
+    ) -> ModelRecommendation:
+        self.calls += 1
+
+        if self.scenario == "temporary_timeout" and self.calls == 1:
+            raise TemporaryModelError("Temporary model timeout")
+
+        if self.scenario == "persistent_failure":
+            raise PersistentModelError("Model service unavailable")
+
+        if self.scenario == "malformed":
+            return json.loads('{"recommendation": "approve"}')
+
+        if self.scenario == "unsupported_claim":
+            return ModelRecommendation(
+                recommendation="approve",
+                explanation=(
+                    "The vendor has worked with the company for 10 years, "
+                    "and the purchase is within the supplied budget."
+                ),
+            )
+
+        return ModelRecommendation(
+            recommendation="approve",
+            explanation=(
+                "Based on the supplied request information, I recommend approval."
+            ),
+        )
+
+
+def validate_model_response(
+    response: Any,
+    request: dict[str, Any],
+    tool_results: dict[str, Any],
+) -> tuple[bool, str]:
+    if not isinstance(response, ModelRecommendation):
+        return False, "model_output_malformed"
+
+    if response.recommendation not in {"approve", "reject"}:
+        return False, "invalid_recommendation"
+
+    if not isinstance(response.explanation, str) or not response.explanation.strip():
+        return False, "missing_explanation"
+
+    explanation = response.explanation.lower()
+
+    vendor = tool_results["vendor"]
+    budget = tool_results["budget"]
+    total = tool_results["total"]
+
+    # Small deterministic claim checks. This intentionally does not attempt
+    # complete natural-language fact verification.
+    unsupported_patterns = [
+        ("10 years", "unsupported_vendor_history"),
+        ("ten years", "unsupported_vendor_history"),
+    ]
+
+    for phrase, error in unsupported_patterns:
+        if phrase in explanation:
+            return False, error
+
+    if "within the supplied budget" in explanation:
+        if total > budget["available"]:
+            return False, "unsupported_budget_claim"
+
+    if "vendor checks passed" in explanation:
+        if not (
+            vendor["exists"]
+            and vendor["active"]
+            and vendor["permitted_currency"] == request["currency"]
+        ):
+            return False, "unsupported_vendor_claim"
+
+    return True, ""

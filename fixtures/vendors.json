@@ -1,0 +1,14 @@
+{
+  "V-101": {
+    "active": true,
+    "permitted_currency": "USD"
+  },
+  "V-102": {
+    "active": false,
+    "permitted_currency": "USD"
+  },
+  "V-103": {
+    "active": true,
+    "permitted_currency": "EUR"
+  }
+}
