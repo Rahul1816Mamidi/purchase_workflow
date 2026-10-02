@@ -250,7 +250,7 @@ Steps:
 - Help fixing some errors.
 - Help with the logic of the mock model adapter.
 
-All code was reviewed and can be explained and modified.
+All code was reviewed 
 
 ---
 
