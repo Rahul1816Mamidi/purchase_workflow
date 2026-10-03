@@ -3,11 +3,10 @@ import json
 import tempfile
 from pathlib import Path
 
-from .model_adapter import MockModelAdapter
+from .model_adapter import MockModelAdapter, SimulatedCrash
 from .models import PurchaseRequest
 from .storage import Storage
-from .tools import lookup_budget, lookup_vendor
-from .workflow import PurchaseWorkflow
+from .workflow import InvalidReviewInput, PurchaseWorkflow
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--testcase",
         type=int,
-        choices=range(1, 7),
+        choices=range(1, 8),
         help="Run one required assignment scenario",
     )
     return parser
@@ -304,12 +303,22 @@ def review_if_required(
         else "reject"
     )
 
-    return workflow.review(
-        result["request_id"],
-        reviewer,
-        decision,
-        note,
-    )
+    while True:
+        try:
+            return workflow.review(
+                result["request_id"],
+                reviewer,
+                decision,
+                note,
+            )
+        except InvalidReviewInput as error:
+            print(f"✗ {error}. Please try again.")
+
+            if not reviewer.strip():
+                reviewer = input("Reviewer name: ").strip()
+
+            if not note.strip():
+                note = input("Review note: ").strip()
 
 
 def run_interactive(db_path: str) -> None:
@@ -407,6 +416,7 @@ def run_scenario(number: int) -> None:
         4: "Malformed / unsupported model output",
         5: "Temporary timeout and persistent failure",
         6: "Interruption after tool results saved -> restart and resume",
+        7: "Repeated submission of the same request",
     }
 
     scenario_header(
@@ -733,11 +743,6 @@ def run_scenario(number: int) -> None:
                 "TC6-001"
             )
 
-            print(
-                "\n--- STEP 1: "
-                "Simulate interruption after tool results are saved ---"
-            )
-
             print("\nINPUT JSON")
             print("----------")
 
@@ -748,71 +753,50 @@ def run_scenario(number: int) -> None:
                 )
             )
 
-            storage.create_request(
-                request.to_dict(),
-                "RECEIVED",
+            print(
+                "\n--- STEP 1: Run the workflow; the process crashes "
+                "after the tool results are saved ---"
             )
 
-            vendor = lookup_vendor(
-                request.vendor_id
+            crashing_workflow = PurchaseWorkflow(
+                storage,
+                MockModelAdapter("crash_after_tools"),
+                progress=lambda message: print(
+                    f"\n[WORKFLOW] {message}"
+                ),
             )
 
-            budget = lookup_budget(
-                request.currency
-            )
+            try:
+                crashing_workflow.submit(request)
+            except SimulatedCrash as error:
+                print(f"\n✗ PROCESS CRASHED: {error}")
 
-            storage.update_request(
-                request.request_id,
-                vendor_result_json=vendor,
-                budget_result_json=budget,
-            )
+            saved = storage.get_request(request.request_id)
 
-            storage.add_event(
-                request.request_id,
-                "VENDOR_LOOKUP_COMPLETED",
-                vendor,
+            print(f"✓ Saved state: {saved['state']}")
+            print(
+                f"✓ Vendor result saved: "
+                f"{saved['vendor_result'] is not None}"
             )
-
-            storage.add_event(
-                request.request_id,
-                "BUDGET_LOOKUP_COMPLETED",
-                budget,
+            print(
+                f"✓ Budget result saved: "
+                f"{saved['budget_result'] is not None}"
             )
 
             print(
-                "✓ Request persisted as RECEIVED"
+                "\n--- STEP 2: Restart: new workflow, "
+                "new storage connection, same database file ---"
             )
 
-            print(
-                "✓ Vendor result persisted"
-            )
-
-            print(
-                "✓ Budget result persisted"
-            )
-
-            print(
-                "✗ Process interrupted before "
-                "deterministic/model steps"
-            )
-
-            print(
-                "\n--- STEP 2: Restart workflow ---"
-            )
-
-            restarted_storage = Storage(
-                db_path
-            )
-
-            workflow = PurchaseWorkflow(
-                restarted_storage,
+            restarted_workflow = PurchaseWorkflow(
+                Storage(db_path),
                 MockModelAdapter("valid"),
                 progress=lambda message: print(
                     f"\n[WORKFLOW] {message}"
                 ),
             )
 
-            result = workflow.submit(
+            result = restarted_workflow.submit(
                 request
             )
 
@@ -858,6 +842,103 @@ def run_scenario(number: int) -> None:
             print(
                 json.dumps(
                     result,
+                    indent=2,
+                )
+            )
+
+            return
+
+        if number == 7:
+
+            request = make_request(
+                "TC7-001"
+            )
+
+            workflow = PurchaseWorkflow(
+                storage,
+                MockModelAdapter("valid"),
+                progress=lambda message: print(
+                    f"\n[WORKFLOW] {message}"
+                ),
+            )
+
+            print("\nINPUT JSON")
+            print("----------")
+
+            print(
+                json.dumps(
+                    request.to_dict(),
+                    indent=2,
+                )
+            )
+
+            print(
+                "\n--- SUBMISSION 1 of 3: "
+                "first submission, then human review ---"
+            )
+
+            result = workflow.submit(request)
+
+            print_workflow_result(result)
+
+            result = review_if_required(
+                workflow,
+                result,
+            )
+
+            for attempt in (2, 3):
+
+                print(
+                    f"\n--- SUBMISSION {attempt} of 3: "
+                    f"identical request ---"
+                )
+
+                result = workflow.submit(request)
+
+                print(f"State returned: {result['state']}")
+
+            duplicate_events = [
+                event
+                for event in result["events"]
+                if event["event_type"]
+                == "DUPLICATE_SUBMISSION"
+            ]
+
+            print("\nREPEATED SUBMISSION CHECK")
+            print("-------------------------")
+
+            print(
+                f"Final records for {request.request_id}: "
+                f"{storage.final_record_count(request.request_id)} "
+                f"(expected 1)"
+            )
+
+            print(
+                f"DUPLICATE_SUBMISSION events: "
+                f"{len(duplicate_events)} "
+                f"(expected 2)"
+            )
+
+            print(
+                "\n--- SAME REQUEST ID, QUANTITY CHANGED ---"
+            )
+
+            changed = make_request(
+                request.request_id,
+                quantity=request.quantity + 1,
+            )
+
+            refused = workflow.submit(changed)
+
+            print(f"Refusal: {refused['errors']}")
+            print(f"State unchanged: {refused['state']}")
+
+            print("\nFINAL JSON")
+            print("----------")
+
+            print(
+                json.dumps(
+                    refused,
                     indent=2,
                 )
             )
@@ -914,6 +995,10 @@ def scenario_menu() -> int:
         )
 
         print(
+            "7. Repeated submission of the same request"
+        )
+
+        print(
             "M. Manual / live purchase request"
         )
 
@@ -922,7 +1007,7 @@ def scenario_menu() -> int:
         )
 
         choice = input(
-            "\nSelect option [0-6/M]: "
+            "\nSelect option [0-7/M]: "
         ).strip().lower()
 
         if choice == "0":
@@ -940,7 +1025,7 @@ def scenario_menu() -> int:
 
             continue
 
-        if choice.isdigit() and 1 <= int(choice) <= 6:
+        if choice.isdigit() and 1 <= int(choice) <= 7:
 
             run_scenario(
                 int(choice)
@@ -961,7 +1046,7 @@ def scenario_menu() -> int:
 
         print(
             "\nInvalid selection. "
-            "Choose 0-6 or M."
+            "Choose 0-7 or M."
         )
 
 

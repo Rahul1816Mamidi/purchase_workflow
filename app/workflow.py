@@ -17,6 +17,10 @@ from .validation import deterministic_checks, validate_request
 MAX_MODEL_RETRIES = 2
 
 
+class InvalidReviewInput(ValueError):
+    """Reviewer name or note is blank. The caller may ask again."""
+
+
 def _fingerprint(request: PurchaseRequest) -> str:
     raw = json.dumps(request.to_dict(), sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -49,7 +53,15 @@ class PurchaseWorkflow:
                     extra_error="request_id_already_exists_with_changed_content",
                 )
 
-            if existing["state"] != "RECEIVED":
+            if existing["state"] == "FAILED":
+                # Resume: saved vendor/budget results are reused, only the model step reruns.
+                self.storage.update_request(request.request_id, state="RECEIVED")
+                self.storage.add_event(
+                    request.request_id,
+                    "RESUMED_AFTER_FAILURE",
+                    {"message": "Previously FAILED request resumed."},
+                )
+            elif existing["state"] != "RECEIVED":
                 self.storage.add_event(
                     request.request_id,
                     "DUPLICATE_SUBMISSION",
@@ -136,6 +148,7 @@ class PurchaseWorkflow:
 
         if existing["model_result"] is None:
             self.progress("Getting model recommendation...")
+            failed_state = "BLOCKED" if findings else "FAILED"
             tool_results = {
                 "vendor": vendor,
                 "budget": budget,
@@ -159,7 +172,7 @@ class PurchaseWorkflow:
                     if not valid:
                         self.storage.update_request(
                             request.request_id,
-                            state="FAILED",
+                            state=failed_state,
                         )
                         self.storage.add_event(
                             request.request_id,
@@ -189,7 +202,7 @@ class PurchaseWorkflow:
                     if attempt == MAX_MODEL_RETRIES:
                         self.storage.update_request(
                             request.request_id,
-                            state="FAILED",
+                            state=failed_state,
                         )
                         self.storage.add_event(
                             request.request_id,
@@ -206,7 +219,7 @@ class PurchaseWorkflow:
                     )
                     self.storage.update_request(
                         request.request_id,
-                        state="FAILED",
+                        state=failed_state,
                     )
                     return self.get_result(request.request_id)
 
@@ -251,6 +264,13 @@ class PurchaseWorkflow:
 
         if decision not in {"approve", "reject"}:
             raise ValueError("Decision must be approve or reject")
+
+        reviewer = (reviewer or "").strip()
+        note = (note or "").strip()
+        if not reviewer:
+            raise InvalidReviewInput("Reviewer name is required")
+        if not note:
+            raise InvalidReviewInput("Review note is required")
 
         final_state = "APPROVED" if decision == "approve" else "REJECTED"
 

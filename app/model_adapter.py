@@ -1,4 +1,5 @@
 import json
+import re
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -11,6 +12,10 @@ class TemporaryModelError(Exception):
 
 class PersistentModelError(Exception):
     pass
+
+
+class SimulatedCrash(Exception):
+    """Raised by the mock to imitate the process dying. The workflow must NOT catch it."""
 
 
 class ModelAdapter(ABC):
@@ -31,6 +36,8 @@ class MockModelAdapter(ModelAdapter):
     unsupported_claim
     temporary_timeout
     persistent_failure
+    crash_after_tools  (first call raises SimulatedCrash, i.e. the process dies
+                        after vendor/budget results were saved)
     """
 
     def __init__(self, scenario: str = "valid"):
@@ -41,6 +48,9 @@ class MockModelAdapter(ModelAdapter):
         self, request: dict[str, Any], tool_results: dict[str, Any]
     ) -> ModelRecommendation:
         self.calls += 1
+
+        if self.scenario == "crash_after_tools" and self.calls == 1:
+            raise SimulatedCrash("Process crashed after tool results were saved")
 
         if self.scenario == "temporary_timeout" and self.calls == 1:
             raise TemporaryModelError("Temporary model timeout")
@@ -110,5 +120,23 @@ def validate_model_response(
             and vendor["permitted_currency"] == request["currency"]
         ):
             return False, "unsupported_vendor_claim"
+
+    # Every number in the explanation must be one we supplied: quantity, unit
+    # price, total or available budget. The request's own IDs are removed first
+    # so "vendor V-101" is fine but an invented "V-777" leaves 777 behind.
+    allowed = [
+        float(request["quantity"]),
+        float(request["unit_price"]),
+        float(total),
+        float(budget["available"]),
+    ]
+    text = response.explanation
+    for known_id in (request["vendor_id"], request["request_id"]):
+        text = re.sub(re.escape(known_id), " ", text, flags=re.IGNORECASE)
+
+    for token in re.findall(r"\d[\d,]*(?:\.\d+)?", text):
+        number = float(token.replace(",", ""))
+        if not any(abs(number - value) < 0.005 for value in allowed):
+            return False, "unsupported_number_claim"
 
     return True, ""

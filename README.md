@@ -51,15 +51,16 @@ Select a required assignment scenario, or run a live manual request.
 4. Malformed / unsupported model output
 5. Temporary timeout and persistent failure
 6. Interruption after tool results saved -> restart and resume
+7. Repeated submission of the same request
 M. Manual / live purchase request
 0. Exit
 
-Select option [0-6/M]:
+Select option [0-7/M]:
 ```
 
 | Option | What it does |
 |---|---|
-| `1`-`6` | Runs a ready-made assignment scenario and prints inputs, tool results, findings, model output, state, errors/retries and events |
+| `1`-`7` | Runs a ready-made assignment scenario and prints inputs, tool results, findings, model output, state, errors/retries and events |
 | `M` | Manual mode: type your own request in the terminal |
 
 ### Manual mode (`M`)
@@ -85,6 +86,7 @@ Reviewer name:
 Review note:
 ```
 
+Reviewer name and note are mandatory: if either is blank, the prompt asks again.
 The reviewer name, decision and note are saved. The final state becomes `APPROVED` or `REJECTED`.
 (In code: `PurchaseWorkflow.review(request_id, reviewer, decision, note)`.)
 
@@ -93,9 +95,6 @@ The reviewer name, decision and note are saved. The final state becomes `APPROVE
 ```bash
 python -m pytest -q
 ```
-
-13 tests cover: valid + approval, insufficient budget, unknown/inactive vendor, currency mismatch, malformed and unsupported model output, timeout then success, persistent failure, resume after saved tools, repeated submission, changed content with same ID, and review only from `PENDING_REVIEW`.
-
 ---
 
 ## 3. Architecture
@@ -139,10 +138,11 @@ python -m pytest -q
         v
 +--------------------------------------------------------------+
 | 5. VALIDATE MODEL OUTPUT              [Python]               |
-|    schema check + known-claim checks                         |
+|    schema check + known-claim checks + number check          |
 |    (model confidence is never trusted)                       |
 +--------------------------------------------------------------+
         | bad output / retries exhausted -> FAILED
+        |   (BLOCKED instead, if a deterministic finding exists)
         v
 +--------------------------------------------------------------+
 | 6. DECISION GATE                      [Python]               |
@@ -168,6 +168,8 @@ RECEIVED --> BLOCKED         (deterministic check failed)
          --> FAILED          (model error / invalid model output)
          --> PENDING_REVIEW --> APPROVED
                             --> REJECTED
+
+FAILED --> RECEIVED          (resubmitting the same request resumes it)
 ```
 
 ### Why this stack (and not others)
@@ -185,6 +187,7 @@ RECEIVED --> BLOCKED         (deterministic check failed)
 - Same request ID + same content: existing record is reused, no duplicate final record.
 - Same request ID + changed content: rejected with an error and logged as `CONFLICTING_RESUBMISSION`; the original record is not modified.
 - Saved vendor/budget/model results are reused after a restart.
+- A `FAILED` request resubmitted with the same content is set back to `RECEIVED` (event `RESUMED_AFTER_FAILURE`); saved vendor/budget results are reused and only the model step runs again. Earlier failure events are kept.
 
 ---
 
@@ -200,8 +203,8 @@ RECEIVED --> BLOCKED         (deterministic check failed)
 | Persistence, resume | |
 | Human approval | |
 
-**Unsupported claims we can detect:** invented vendor history ("10 years"), "within budget" when the total exceeds it, and "vendor checks passed" when they did not.
-**Not detected:** any other invented fact (e.g. discounts, delivery dates), because the check is rule-based, not full fact verification.
+**Unsupported claims we can detect:** invented vendor history ("10 years"), "within budget" when the total exceeds it, "vendor checks passed" when they did not, and **any number that was not supplied**: every number in the explanation must be the quantity, unit price, total or available budget (the request's own vendor and request IDs are ignored). So "12 years", "99.5% on-time" or an invented vendor ID like `V-777` are rejected.
+**Not detected:** invented facts without numbers (e.g. "preferred supplier"), numbers written as words ("twelve years"), and a claim whose number happens to equal a supplied one (the original phrase checks still catch "10 years"). The check is rule-based, not full fact verification.
 
 ---
 
@@ -228,7 +231,7 @@ Steps:
 
 - Real explanations instead of canned ones, with data staying on the machine.
 - A stricter prompt: "use only the facts provided".
-- Stronger claim checks, e.g. every number in the explanation must match the supplied data.
+- Stronger claim checks beyond the current number check, e.g. numbers written as words and claims without numbers.
 
 ---
 
@@ -245,15 +248,27 @@ Steps:
 
 **Approx. time:** 3.5 hours (pipeline design, implementation, error fixing, git commit).
 
-**AI assistance (OpenAI):**
+**AI assistance (OpenAI)(claude):**
 
 - Help fixing some errors.
 - Help with the logic of the mock model adapter.
 
-All code was reviewed 
+All code was reviewed and can be explained and modified.
 
 ---
 
 ## 8. Reused vs new code
 
 All code (workflow, storage, tools, mock adapter, CLI, tests) was newly written for this exercise. No external project code was reused.
+
+---
+
+## 9. Recent changes
+
+- **Review input:** a blank reviewer name or note is rejected (`InvalidReviewInput`); the terminal asks again.
+- **Claim check:** added the number check described in section 4; the three original checks are kept.
+- **Resume:** a `FAILED` request can now be resumed by resubmitting it (previously it was treated as a duplicate and stayed stuck).
+- **Blocked requests:** if the model fails on a request that already has a deterministic finding, the state stays `BLOCKED` instead of `FAILED`, so the real reason (e.g. `insufficient_budget`) stays visible.
+- **Scenario 6:** now a real interruption. The mock adapter mode `crash_after_tools` raises `SimulatedCrash` after vendor/budget results are saved; the menu then starts a new workflow on a new `Storage` for the same database file and resubmits. A test counts the tool calls (1 vendor, 1 budget).
+- **Scenario 7 (new menu option):** submits the same request three times (with a human review after the first), then the same ID with a changed quantity. It prints the number of final records (1), the `DUPLICATE_SUBMISSION` events (2) and the refusal.
+
